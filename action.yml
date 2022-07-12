@@ -1,0 +1,133 @@
+name: Execute Terraform tf sec operation
+description: Execute a terraform tfsec on already created environment
+branding:
+  icon: cloud
+  color: white
+inputs:
+  environment-name:
+    description: Name of Cloudify environment to create
+    required: true
+  environment-id:
+    description: Id of Cloudify environment to create
+    default: "-"
+    required: false
+  labels:
+    description: |
+      A labels list of the form <key>:<value>,<key>:<value>.
+      Any comma and colon in <value> must be escaped with \.
+      The labels’ keys are saved in lowercase.
+    required: false
+    default: "-"
+  tfsec-config:
+    description: |
+      infracost api key to allow calling cloud pricing api.
+    required: true
+    default: "-"  
+outputs:
+  terraform-sec:
+    description: Terraform module plan
+    value: ${{ steps.get_terraform_sec.outputs.cli-output }}
+runs:
+  using: "composite"
+  steps:
+    - name: Check if Environment exists
+      if: ${{ inputs.environment-id == '-' }}
+      id: check_environment
+      uses: cloudify-cosmo/environment-data-using-labels-action@v1.2
+      with:
+          environment-name: ${{ inputs.environment-name }}
+          labels: ${{ inputs.labels }}
+    - name: Set Deployment exists
+      id: check_if_deployment_exists
+      shell: python
+      run: |
+        import io
+        import os
+        import json
+        import yaml
+
+        def prepare_parameters_file(variables, environment_variables):
+            
+          tfsec_config = json.loads("${{ inputs.tfsec-config }}")
+
+          workflow_parms = {
+            'operation': 'terraform.tfsec',
+            'node_ids': ['terraform_module']
+          }
+          with open('workflow_params.yaml', 'w') as outfile:
+            yaml.dump(workflow_parms, outfile)
+
+
+        deployment_id = "${{ inputs.environment-id }}"
+        if deployment_id != '-':
+          print ('::set-output name=exists::{0}'.format('true'))
+          print ('::set-output name=deployment_id::{0}'.format(deployment_id))
+          prepare_parameters_file("${{ inputs.variables-file }}", "${{ inputs.environment-file }}")
+        else:
+          environments = json.loads(r"""${{steps.check_environment.outputs.environment-data}}""")
+          if len(environments)==0:
+            print ('::set-output name=exists::{0}'.format('false'))
+          elif len(environments)==1:
+            print ('::set-output name=exists::{0}'.format('true'))
+            print ('::set-output name=deployment_id::{0}'.format(environments[0].get('deployment_id')))
+            prepare_parameters_file("${{ inputs.variables-file }}", "${{ inputs.environment-file }}")
+          else:
+            dep_ids = [dep.get('deployment_id') for dep in environments]
+            raise Exception("Your name/labels may refer to these deployments {0} , please specify which one using environment-id input".format(dep_ids))
+
+    - name: Execute Terraform plan workflow
+      if: ${{ steps.check_if_deployment_exists.outputs.exists == 'true' }}
+      id: terraform_plan_wf
+      uses: cloudify-cosmo/execute-workflow-action@v1.2
+      with:
+        environment-name: ${{ steps.check_if_deployment_exists.outputs.deployment_id }}
+        workflow: "execute_operation"
+        parameters-file: 'workflow_params.yaml'
+
+
+    - name: Get Deployment ID
+      if: ${{ steps.check_if_deployment_exists.outputs.exists != 'true' }}
+      id: get_deployment_id
+      shell: bash
+      run: |
+        content=`cat env-plan-data.json`
+        # the following lines are only required for multi line json
+        content="${content//'%'/'%25'}"
+        content="${content//$'\n'/'%0A'}"
+        content="${content//$'\r'/'%0D'}"
+        # end of optional handling for multi line json
+        echo "::set-output name=packageJson::$content"
+        
+    - name: get deployment executions
+      id: get_executions
+      uses: cloudify-cosmo/cli-action@v1.2
+      with:
+        command: executions list --descending -d ${{ steps.check_if_deployment_exists.outputs.deployment_id || fromJson(steps.get_deployment_id.outputs.packageJson).deployment_id}} --json
+
+    - name: parse deployment executions
+      id: get_last_execution_id
+      shell: python
+      run: |
+        import json
+        cli_output = ${{steps.get_executions.outputs.cli-output}}
+        executions = json.loads(cli_output)
+        print ('::set-output name=execution_id::{0}'.format(executions[0].get('id')))
+
+    - name: get execution events
+      id: get_execution_events
+      uses: cloudify-cosmo/cli-action@v1.2
+      with:
+        command: events list ${{ steps.get_last_execution_id.outputs.execution_id }}
+        
+    - name: get terraform module plan runtime property
+      id: get_terraform_sec
+      shell: python
+      run: |
+        import json
+        cli_output = ${{steps.get_execution_events.outputs.cli-output}}
+        print('cli_output {0}'.format(cli_output))
+        cli_output = cli_output.decode('utf-8')
+        cli_output = cli_output.replace('%','%25')
+        cli_output = cli_output.replace('\n','%0A')
+        cli_output = cli_output.replace('\r','%0D')
+        print ('::set-output name=cli-output::{0}'.format(cli_output))
